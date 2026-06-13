@@ -37,19 +37,32 @@ import {
   renderEnhancedDashboard,
   renderExtendedRoute,
 } from './extendedPages.js';
-import { initializeServices, memberService } from './services.js';
+import {
+  initializeServices,
+  loadLoanAndPaymentState,
+  loanService,
+  memberService,
+  paymentService,
+} from './services.js';
 
 const app = document.querySelector('#app');
 const storedTheme = localStorage.getItem('sacada-theme');
 
 app.innerHTML = '<div class="loading-state">Loading SACADA records...</div>';
 const serviceErrors = await initializeServices();
+let remoteLoanPaymentState = { loans: [], payments: [] };
+try {
+  remoteLoanPaymentState = await loadLoanAndPaymentState();
+} catch (error) {
+  console.error('Supabase loan/payment load failed.', error);
+  serviceErrors.push({ name: 'loans/payments', error });
+}
 
 const state = {
   members: seedMembers.length ? structuredClone(seedMembers) : memberService.list(),
-  loanApplications: structuredClone(seedLoanApplications),
-  activeLoans: structuredClone(seedActiveLoans),
-  payments: structuredClone(seedPayments),
+  loanApplications: remoteLoanPaymentState.loans.length ? remoteLoanPaymentState.loans.map(remoteLoanToApplication) : structuredClone(seedLoanApplications),
+  activeLoans: remoteLoanPaymentState.loans.length ? remoteLoanPaymentState.loans : structuredClone(seedActiveLoans),
+  payments: remoteLoanPaymentState.payments.length ? remoteLoanPaymentState.payments : structuredClone(seedPayments),
   route: location.hash || '#/dashboard',
   memberFilters: {
     search: '',
@@ -81,6 +94,8 @@ const state = {
     activeLoans: { key: 'nextDueDate', direction: 'asc' },
   },
   memberTab: 'Personal Information',
+  memberDraft: null,
+  memberDraftKey: '',
   loanStep: 1,
   theme: storedTheme ? JSON.parse(storedTheme) : structuredClone(defaultTheme),
   themeDraft: storedTheme ? JSON.parse(storedTheme) : structuredClone(defaultTheme),
@@ -348,9 +363,14 @@ function renderMemberList() {
 }
 
 function renderMemberEditor(memberId, isNew) {
-  const blankMember = createBlankMember();
-  const member = isNew ? blankMember : state.members.find((item) => item.id === memberId);
-  if (!member) return notFound('Member record was not found.');
+  const sourceMember = isNew ? null : state.members.find((item) => item.id === memberId);
+  if (!isNew && !sourceMember) return notFound('Member record was not found.');
+  const draftKey = isNew ? 'new' : memberId;
+  if (!state.memberDraft || state.memberDraftKey !== draftKey) {
+    state.memberDraft = structuredClone(sourceMember || createBlankMember());
+    state.memberDraftKey = draftKey;
+  }
+  const member = state.memberDraft;
 
   return `
     <section class="page-header">
@@ -809,7 +829,7 @@ function renderLoanApplicationEditor(applicationId) {
       <div class="panel-title">
         <div>
           <h3>Loan Computation / Statement of Account</h3>
-          <p>Uses default 14% yearly interest, 1% processing fee, and simple monthly amortization.</p>
+          <p>Uses default 12% interest, 2% collection fee, 1% processing fee, and simple monthly amortization.</p>
         </div>
       </div>
       ${renderComputationInputs(application.computation)}
@@ -949,7 +969,8 @@ function renderComputationInputs(computation) {
     <div class="form-grid four">
       ${field('Loan Amount', 'loanAmount', computation.loanAmount, { type: 'number' })}
       ${field('Term in Months', 'termMonths', computation.termMonths, { type: 'select', choices: ['12', '18', '24', '36'] })}
-      ${field('Interest/Collection Rate', 'annualInterestRate', computation.annualInterestRate, { type: 'number', helper: 'Default is 14% yearly or 1.17% per month.' })}
+      ${field('Interest Rate', 'annualInterestRate', computation.annualInterestRate, { type: 'number', helper: 'Default is 12% of principal.' })}
+      ${field('Collection Fee Rate', 'collectionFeeRate', computation.collectionFeeRate ?? 2, { type: 'number', helper: 'Default is 2% of principal.' })}
       ${field('Processing Fee Rate', 'processingFeeRate', computation.processingFeeRate, { type: 'number', helper: 'Default is 1% of principal loan amount.' })}
       ${field('Previous Loan Balance', 'previousLoanBalance', computation.previousLoanBalance, { type: 'number' })}
       ${field('Existing Capital Share', 'existingCapitalShare', computation.existingCapitalShare, { type: 'number' })}
@@ -1656,7 +1677,8 @@ function createBlankLoanApplication() {
     computation: {
       loanAmount: 0,
       termMonths: 12,
-      annualInterestRate: 14,
+      annualInterestRate: 12,
+      collectionFeeRate: 2,
       processingFeeRate: 1,
       previousLoanBalance: 0,
       existingCapitalShare: member.shareCapital,
@@ -1719,28 +1741,41 @@ function getFormValues(form) {
 }
 
 async function updateMemberFromForm(form) {
-  const values = getFormValues(form);
+  preserveMemberFormDraft(form);
   const existingId = form.dataset.memberId;
   const current = existingId ? state.members.find((member) => member.id === existingId) : null;
-  const target = current || createBlankMember();
-  Object.assign(target, values);
-  numericMemberFields().forEach((key) => {
-    target[key] = toNumber(target[key]);
-  });
+  const target = state.memberDraft || current || createBlankMember();
   target.fullName = `${target.lastName || ''}, ${target.firstName || ''} ${target.middleName ? `${target.middleName.charAt(0)}.` : ''}`.trim();
   target.initials = `${target.firstName?.charAt(0) || 'N'}${target.lastName?.charAt(0) || 'M'}`.toUpperCase();
   if (!current) {
     state.members.push(target);
   }
   try {
-    await memberService.save(state.members);
+    const saved = await memberService.saveOne(target);
+    const stateIndex = state.members.findIndex((member) => member.id === saved.id);
+    if (stateIndex >= 0) state.members[stateIndex] = saved;
+    state.memberDraft = structuredClone(saved);
+    state.memberDraftKey = saved.id;
     state.notice = `${target.fullName || target.id} was saved in Supabase.`;
     location.hash = `#/members/${target.id}`;
   } catch (error) {
     console.error('Supabase member save failed.', error);
-    state.notice = `${target.fullName || target.id} was saved locally, but Supabase rejected the save. Check RLS insert/update policies.`;
+    if (!current) {
+      state.members = state.members.filter((member) => member !== target);
+    }
+    const validationDetails = Object.values(error.errors || {}).join(' ');
+    const detail = [error.code, validationDetails || error.message].filter(Boolean).join(': ');
+    state.notice = `${target.fullName || target.id} was not saved. ${detail || 'Supabase rejected the request.'}`;
     renderShell();
   }
+}
+
+function preserveMemberFormDraft(form = document.querySelector('#member-form')) {
+  if (!form || !state.memberDraft) return;
+  Object.assign(state.memberDraft, getFormValues(form));
+  numericMemberFields().forEach((key) => {
+    state.memberDraft[key] = toNumber(state.memberDraft[key]);
+  });
 }
 
 function numericMemberFields() {
@@ -1776,7 +1811,50 @@ function numericMemberFields() {
   ];
 }
 
-function updateLoanFromForm(form) {
+async function refreshLoanPaymentState() {
+  const remote = await loadLoanAndPaymentState();
+  state.activeLoans = remote.loans;
+  state.payments = remote.payments;
+  state.loanApplications = remote.loans.map(remoteLoanToApplication);
+}
+
+function remoteLoanToApplication(loan) {
+  const raw = loan.raw || {};
+  return {
+    id: loan.accountNumber,
+    dbId: loan.id,
+    accountNumber: loan.accountNumber,
+    memberId: loan.memberId,
+    borrowerName: loan.borrowerName,
+    requestedAmount: loan.originalAmount,
+    approvedAmount: loan.originalAmount,
+    applicationDate: raw.created_at?.slice(0, 10) || loan.releaseDate,
+    purpose: '',
+    status: loan.status,
+    termMonths: loan.termMonths,
+    startDate: loan.releaseDate,
+    endDate: '',
+    installmentAmount: loan.monthlyAmortization,
+    paymentMethod: 'Cash',
+    remarks: '',
+    computation: {
+      loanAmount: loan.originalAmount,
+      termMonths: loan.termMonths,
+      annualInterestRate: loan.originalAmount ? Number(raw.interest_amount || 0) / loan.originalAmount * 100 : 12,
+      collectionFeeRate: loan.originalAmount ? Number(raw.collection_fee || 0) / loan.originalAmount * 100 : 2,
+      processingFeeRate: loan.originalAmount ? Number(raw.processing_fee || 0) / loan.originalAmount * 100 : 1,
+      releaseDate: loan.releaseDate,
+      firstDueDate: loan.releaseDate,
+      previousLoanBalance: 0,
+      existingCapitalShare: 0,
+      additionalCapitalShare: 0,
+      savingsDeposit: 0,
+      timeDeposit: 0,
+    },
+  };
+}
+
+async function updateLoanFromForm(form) {
   const values = getFormValues(form);
   const existingId = form.dataset.applicationId;
   const current = existingId ? state.loanApplications.find((loan) => loan.id === existingId) : null;
@@ -1791,7 +1869,8 @@ function updateLoanFromForm(form) {
   target.computation = {
     loanAmount: toNumber(values.loanAmount, target.approvedAmount || target.requestedAmount),
     termMonths: toNumber(values.termMonths, target.termMonths || 12),
-    annualInterestRate: toNumber(values.annualInterestRate, 14),
+    annualInterestRate: toNumber(values.annualInterestRate, 12),
+    collectionFeeRate: toNumber(values.collectionFeeRate, 2),
     processingFeeRate: toNumber(values.processingFeeRate, 1),
     previousLoanBalance: toNumber(values.previousLoanBalance),
     existingCapitalShare: toNumber(values.existingCapitalShare, member.shareCapital),
@@ -1802,41 +1881,56 @@ function updateLoanFromForm(form) {
     firstDueDate: values.firstDueDate || values.startDate || '',
   };
 
-  if (!current) {
-    state.loanApplications.push(target);
-  }
+  const payload = {
+    member_id: member.id,
+    voucher_no: values.id || target.id,
+    loan_year: (target.computation.releaseDate || '').slice(0, 4),
+    loan_amount: target.computation.loanAmount,
+    loan_terms: target.computation.termMonths,
+    interest_rate: target.computation.annualInterestRate / 100,
+    collection_fee_rate: target.computation.collectionFeeRate / 100,
+    processing_fee_rate: target.computation.processingFeeRate / 100,
+    loan_released: target.computation.releaseDate,
+    status: target.status === 'Completed' ? 'Paid' : target.status,
+  };
 
-  state.notice = `${target.id} was saved in the loan application list.`;
-  location.hash = `#/loan-applications/${target.id}`;
+  try {
+    const saved = current?.dbId ? await loanService.update(current.dbId, payload) : await loanService.create(payload);
+    await refreshLoanPaymentState();
+    const routeId = saved.voucher_no || saved.id;
+    state.notice = `${routeId} was saved in Supabase.`;
+    location.hash = `#/loan-applications/${routeId}`;
+  } catch (error) {
+    console.error('Supabase loan save failed.', error);
+    state.notice = error.message || 'Loan could not be saved.';
+    renderShell();
+  }
 }
 
-function recordPayment(form) {
+async function recordPayment(form) {
   const values = getFormValues(form);
   const loan = state.activeLoans.find((item) => item.accountNumber === values.loanAccount);
   if (!loan) return;
-  const amountPaid = toNumber(values.amountPaid);
-  const penalty = toNumber(values.penalty);
-  loan.remainingBalance = Math.max(0, loan.remainingBalance - amountPaid);
-  loan.paidMonths += amountPaid > 0 ? 1 : 0;
-  loan.lastPaymentDate = values.paymentDate;
-  loan.penalties = Math.max(0, loan.penalties - penalty);
-  loan.status = loan.remainingBalance <= 0 ? 'Completed' : 'Updated';
-
-  state.payments.unshift({
-    id: `PAY-${Date.now()}`,
-    date: values.paymentDate,
-    borrower: loan.borrowerName,
-    loanAccount: loan.accountNumber,
-    amountPaid,
-    penalty,
-    paymentMethod: values.paymentMethod,
-    orNumber: values.orNumber,
-    encodedBy: 'SACADA Admin',
-    remarks: values.remarks,
-  });
-
-  state.notice = `Payment recorded for ${loan.borrowerName}. Remaining balance is now ${formatCurrency(loan.remainingBalance)}.`;
-  location.hash = '#/payments/history';
+  try {
+    const result = await paymentService.create({
+      loan_id: loan.id,
+      member_id: loan.memberId,
+      payment_date: values.paymentDate,
+      amount_paid: toNumber(values.amountPaid),
+      penalty: toNumber(values.penalty),
+      payment_method: values.paymentMethod,
+      or_number: values.orNumber,
+      encoded_by: 'Staff',
+      remarks: values.remarks,
+    });
+    await refreshLoanPaymentState();
+    state.notice = `Payment recorded for ${loan.borrowerName}. Remaining balance is now ${formatCurrency(result.loan.loan_receivable)}.`;
+    location.hash = '#/payments/history';
+  } catch (error) {
+    console.error('Supabase payment save failed.', error);
+    state.notice = error.message || 'Payment could not be recorded.';
+    renderShell();
+  }
 }
 
 function openConfirm(config) {
@@ -1884,6 +1978,15 @@ function rejectLoan(id) {
 }
 
 function handleInput(event) {
+  const memberForm = event.target.closest('#member-form');
+  if (memberForm && event.target.name && state.memberDraft) {
+    const value = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
+    state.memberDraft[event.target.name] = numericMemberFields().includes(event.target.name)
+      ? toNumber(value)
+      : value;
+    return;
+  }
+
   const filterGroup = event.target.closest('[data-filter-group]');
   if (filterGroup && event.target.name) {
     state[filterGroup.dataset.filterGroup][event.target.name] = event.target.value;
@@ -1917,6 +2020,7 @@ async function handleClick(event) {
     document.querySelector('#sidebar')?.classList.toggle('open');
   }
   if (action === 'set-member-tab') {
+    preserveMemberFormDraft();
     state.memberTab = actionElement.dataset.tab;
     renderShell();
   }
@@ -1928,7 +2032,7 @@ async function handleClick(event) {
     await updateMemberFromForm(document.querySelector('#member-form'));
   }
   if (action === 'save-loan-draft') {
-    updateLoanFromForm(document.querySelector('#loan-form'));
+    await updateLoanFromForm(document.querySelector('#loan-form'));
   }
   if (action === 'approve-loan') {
     approveLoan(actionElement.dataset.id);
@@ -1937,7 +2041,7 @@ async function handleClick(event) {
     rejectLoan(actionElement.dataset.id);
   }
   if (action === 'record-payment') {
-    recordPayment(document.querySelector('#payment-form'));
+    await recordPayment(document.querySelector('#payment-form'));
   }
   if (action === 'print-page') {
     window.print();

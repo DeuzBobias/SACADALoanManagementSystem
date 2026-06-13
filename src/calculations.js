@@ -40,17 +40,18 @@ export function addMonths(dateValue, monthOffset) {
 export function calculateLoan(input = {}) {
   const loanAmount = toNumber(input.loanAmount);
   const termMonths = Math.max(1, toNumber(input.termMonths, 12));
-  const annualInterestRate = toNumber(input.annualInterestRate, 14) / 100;
+  const interestRate = toNumber(input.interestRate ?? input.annualInterestRate, 12) / 100;
+  const collectionFeeRate = toNumber(input.collectionFeeRate, 2) / 100;
   const processingFeeRate = toNumber(input.processingFeeRate, 1) / 100;
   const previousLoanBalance = toNumber(input.previousLoanBalance);
   const existingCapitalShare = toNumber(input.existingCapitalShare);
   const additionalCapitalShare = toNumber(input.additionalCapitalShare);
   const savingsDeposit = toNumber(input.savingsDeposit);
   const timeDeposit = toNumber(input.timeDeposit);
-  const years = termMonths / 12;
-
-  const totalInterest = loanAmount * annualInterestRate * years;
-  const totalPayable = loanAmount + totalInterest;
+  const interestAmount = loanAmount * interestRate;
+  const collectionFee = loanAmount * collectionFeeRate;
+  const totalInterest = interestAmount + collectionFee;
+  const totalPayable = loanAmount + interestAmount + collectionFee;
   const monthlyAmortization = totalPayable / termMonths;
   const processingFee = loanAmount * processingFeeRate;
   const netTakeHome =
@@ -61,7 +62,9 @@ export function calculateLoan(input = {}) {
   return {
     loanAmount,
     termMonths,
-    annualInterestRate,
+    annualInterestRate: interestRate,
+    interestRate,
+    collectionFeeRate,
     processingFeeRate,
     previousLoanBalance,
     existingCapitalShare,
@@ -69,6 +72,8 @@ export function calculateLoan(input = {}) {
     savingsDeposit,
     timeDeposit,
     totalInterest,
+    interestAmount,
+    collectionFee,
     totalPayable,
     monthlyAmortization,
     processingFee,
@@ -76,6 +81,7 @@ export function calculateLoan(input = {}) {
     endingLoanBalance: totalPayable,
     principalPortion,
     interestPortion,
+    loanReceivable: totalPayable,
   };
 }
 

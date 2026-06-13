@@ -1,4 +1,21 @@
 import { supabase } from './supabaseClient.js';
+import {
+  memberService as backendMemberService,
+  loanService,
+  loanFromDb,
+  paymentService,
+  paymentFromDb,
+  dashboardService,
+  reportService,
+  statementService,
+  delinquencyService,
+  capitalService as backendCapitalService,
+  timeDepositService as backendTimeDepositService,
+  expenseService as backendExpenseService,
+  dividendService as backendDividendService,
+  patronageService as backendPatronageService,
+  birRegistryService as backendBirRegistryService,
+} from './services/index.js';
 
 const mockMembers = [
   {
@@ -434,7 +451,29 @@ function createService(name) {
   };
 }
 
-export const memberService = createService('members');
+const legacyMemberService = createService('members');
+export const memberService = {
+  list: () => legacyMemberService.list(),
+  async load() {
+    const rows = await backendMemberService.list();
+    cache.members = rows.map(memberFromDb);
+    return cache.members;
+  },
+  async save(records) {
+    const saved = await Promise.all(records.map((record) => backendMemberService.upsert(memberToDb(record))));
+    cache.members = saved.map(memberFromDb);
+    return cache.members;
+  },
+  async saveOne(record) {
+    const saved = await backendMemberService.upsert(memberToDb(record));
+    const mapped = memberFromDb(saved);
+    const index = cache.members.findIndex((member) => member.id === mapped.id);
+    if (index >= 0) cache.members[index] = mapped;
+    else cache.members.push(mapped);
+    return mapped;
+  },
+  reset: () => legacyMemberService.reset(),
+};
 export const capitalService = createService('capitalTransactions');
 export const delinquentLoanService = createService('delinquentLoans');
 export const timeDepositService = createService('timeDeposits');
@@ -443,6 +482,32 @@ export const dividendService = createService('dividends');
 export const patronageService = createService('patronage');
 export const birRegistryService = createService('birRegistry');
 export const financialService = createService('financialStatement');
+
+export {
+  loanService,
+  paymentService,
+  dashboardService,
+  reportService,
+  statementService,
+  delinquencyService,
+  backendCapitalService,
+  backendTimeDepositService,
+  backendExpenseService,
+  backendDividendService,
+  backendPatronageService,
+  backendBirRegistryService,
+  loanFromDb,
+};
+
+export async function loadLoanAndPaymentState() {
+  const loanRows = await loanService.list();
+  const paymentRows = await paymentService.list();
+  const loanMap = new Map(loanRows.map((loan) => [loan.id, loan]));
+  return {
+    loans: loanRows.map(loanFromDb),
+    payments: paymentRows.map((payment) => paymentFromDb(payment, payment.loans || loanMap.get(payment.loan_id))),
+  };
+}
 
 export async function initializeServices() {
   const results = await Promise.allSettled([
